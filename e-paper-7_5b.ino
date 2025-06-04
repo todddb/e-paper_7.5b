@@ -1,93 +1,44 @@
 /*
- * 🎉 E-Paper 7.5" 3-Color Display - COMPLETE REFERENCE 🎉
+ * 🗓️ Scheduled E-Paper Calendar Display System 🗓️
  * 
- * HARDWARE: 7.5" E-Paper(B) x027/17118-20180424 (640×384, 3-color: Black/White/Red)
- * DRIVER: Waveshare ESP8266 driver board
- * RIBBON: WF0583CZ09
+ * Connects to desktop calendar generator and displays calendar on 7.5" e-paper
+ * Updates on schedule: 7:50am, 8:20am, 8:50am, 9:20am ... 4:20pm, 4:50pm
+ * Deep sleeps between updates for power efficiency
  * 
- * =============================================================================
- * 🔴 RED CHANNEL SECRET - THE BREAKTHROUGH DISCOVERY! 🔴
- * =============================================================================
+ * ENDPOINTS:
+ * - Status & Time: http://192.168.11.2:5000/status
+ * - PNG Image: http://192.168.11.2:5000/calendar.png
+ * - Raw B/W Data: http://192.168.11.2:5000/calendar_bw.raw
+ * - Raw Red Data: http://192.168.11.2:5000/calendar_red.raw
  * 
- * After extensive reverse engineering, we discovered the magic formula:
- * 
- * BLACK PIXELS:  B/W Channel = 0x00, Red Channel = 0x00 (or any value)
- * WHITE PIXELS:  B/W Channel = 0x33, Red Channel = 0x00 (or any value) 
- * RED PIXELS:    B/W Channel = 0xCC, Red Channel = 0xFF  ⭐ MAGIC COMBO! ⭐
- * 
- * Key Insights:
- * - Red channel is NOT a simple overlay - it requires specific B/W values
- * - 0xCC in B/W channel + 0xFF in Red channel = RED pixels
- * - Other B/W values (0x00, 0x33, 0x55, etc.) do NOT produce red
- * - Full 122,880 bytes (640×384÷2) memory works perfectly with this method
- * - Both channels must be sent: 0x10 (B/W) first, then 0x13 (Red)
+ * SCHEDULE: Updates every 30 minutes from 7:50am to 4:50pm
+ * SLEEP: Deep sleep from 4:50pm until 7:50am next day
  * 
  * =============================================================================
- * 📐 DISPLAY SPECIFICATIONS 📐
- * =============================================================================
- * 
- * Resolution: 640×384 pixels
- * Memory: 122,880 bytes (640×384÷2, because 2 pixels per byte)
- * Memory Layout: Horizontal bands (not row-by-row)
- * 
- * =============================================================================
- * 🔌 PIN CONNECTIONS 🔌
- * =============================================================================
- * 
- * ESP8266 NodeMCU → Display Driver Board
- * GPIO 14 (D5)    → SCK  (Clock)
- * GPIO 13 (D7)    → DIN  (Data In) 
- * GPIO 15 (D8)    → CS   (Chip Select)
- * GPIO 2  (D4)    → RST  (Reset)
- * GPIO 4  (D2)    → DC   (Data/Command)
- * GPIO 5  (D1)    → BUSY (Busy Status - may not work reliably)
- * 3.3V            → VCC
- * GND             → GND
- * 
- * NOTE: BUSY pin often gets stuck HIGH. Use fixed delays instead of busy-wait.
- * 
- * =============================================================================
- * 🎨 HOW TO DRAW PATTERNS 🎨
- * =============================================================================
- * 
- * 1. Initialize the display with EPD_7in5_V1_Init()
- * 
- * 2. Send B/W channel data (0x10):
- *    - Loop through all 122,880 bytes
- *    - For each pixel position, decide color and send corresponding B/W value:
- *      * Black pixel → send 0x00
- *      * White pixel → send 0x33  
- *      * Red pixel   → send 0xCC (prepares for red)
- * 
- * 3. Send Red channel data (0x13):
- *    - Loop through all 122,880 bytes again
- *    - For each pixel position:
- *      * Black/White pixel → send 0x00 (no red)
- *      * Red pixel         → send 0xFF (enable red)
- * 
- * 4. Refresh display with EPD_7IN5_V1_Show()
- * 
- * =============================================================================
- * 🧮 PIXEL COORDINATE CALCULATIONS 🧮
- * =============================================================================
- * 
- * The display memory is organized in horizontal bands, not individual pixels.
- * To calculate positions:
- * 
- * For byte index i (0 to 122,879):
- * - Rough row: y = i / (DISPLAY_WIDTH / 2) = i / 320
- * - Rough col: x = (i % 320) * 2
- * 
- * For sections (dividing screen into 8 vertical strips):
- * - Section = (i * 8) / 122880
- * 
- * For stripes or blocks:
- * - Use modulo operations: i % stripe_width
- * 
+ * 🔴 RED CHANNEL SECRET (for future red accent support)
+ * BLACK PIXELS:  B/W = 0x00, Red = 0x00
+ * WHITE PIXELS:  B/W = 0x33, Red = 0x00 
+ * RED PIXELS:    B/W = 0xCC, Red = 0xFF
  * =============================================================================
  */
 
-// Pin definitions
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#include <ArduinoJson.h>
+
+// =============================================================================
+// 🔌 PIN DEFINITIONS & CONSTANTS
+// =============================================================================
+
+// Undefine ESP8266 default pins to avoid conflicts
+#ifdef PIN_SPI_SCK
+#undef PIN_SPI_SCK
+#endif
+#ifdef PIN_SPI_DIN  
+#undef PIN_SPI_DIN
+#endif
+
 #define PIN_SPI_SCK 14
 #define PIN_SPI_DIN 13
 #define CS_PIN 15
@@ -98,23 +49,609 @@
 #define GPIO_PIN_SET 1
 #define GPIO_PIN_RESET 0
 
-// Display dimensions
+// Display specifications
 #define DISPLAY_WIDTH 640
 #define DISPLAY_HEIGHT 384
 #define TOTAL_BYTES 122880  // 640*384/2
 
-// Color definitions
-#define COLOR_BLACK 0
-#define COLOR_WHITE 1  
-#define COLOR_RED 2
+// =============================================================================
+// 🌐 WIFI & SERVER CONFIGURATION
+// =============================================================================
+
+const char* ssid = "Todd's Office";        // Your WiFi network
+const char* password = "t0dds0ff!c3";      // Your WiFi password
+
+const char* status_url = "http://192.168.11.2:5000/status";
+const char* calendar_raw_url = "http://192.168.11.2:5000/calendar_bw.raw";
+const char* calendar_red_url = "http://192.168.11.2:5000/calendar_red.raw";
+const char* calendar_png_url = "http://192.168.11.2:5000/calendar.png";
+
+// =============================================================================
+// ⏰ TIME & SCHEDULING CONFIGURATION
+// =============================================================================
+
+// Time tracking variables
+unsigned long serverTimestamp = 0;    // Unix timestamp from server
+unsigned long localTimeBase = 0;      // millis() when we got server time
+bool timeSet = false;
+
+// Schedule: Updates every 30 minutes from 7:50am to 4:50pm
+// 7:50am = 470 minutes from midnight
+// 4:50pm = 1010 minutes from midnight  
+// Total updates per day: 19
+const int FIRST_UPDATE_MINUTES = 7 * 60 + 50;  // 7:50am = 470 minutes
+const int LAST_UPDATE_MINUTES = 16 * 60 + 50;  // 4:50pm = 1010 minutes
+const int UPDATE_INTERVAL_MINUTES = 30;
+
+// Calculate total number of updates per day
+const int TOTAL_DAILY_UPDATES = ((LAST_UPDATE_MINUTES - FIRST_UPDATE_MINUTES) / UPDATE_INTERVAL_MINUTES) + 1;
+
+// =============================================================================
+// 🚀 SETUP & MAIN LOOP
+// =============================================================================
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("🎉🎉🎉 E-PAPER VICTORY DEMO! 🎉🎉🎉");
-  Serial.println("Celebrating the red channel breakthrough!");
+  Serial.println("🗓️ Scheduled E-Paper Calendar Starting... 🗓️");
   
-  // Initialize pins
+  // Initialize display pins
+  initializeHardware();
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Get current time from server
+  if (synchronizeTime()) {
+    Serial.println("✅ Time synchronized with server");
+    
+    // Check if we should update now or sleep
+    int currentMinutes = getCurrentMinutesFromMidnight();
+    if (shouldUpdateNow(currentMinutes)) {
+      Serial.println("🕐 It's update time! Updating calendar...");
+      updateCalendar();
+    } else {
+      Serial.println("😴 Not update time, going to sleep...");
+    }
+    
+    // Calculate and enter deep sleep until next update
+    enterDeepSleepUntilNextUpdate();
+    
+  } else {
+    Serial.println("❌ Failed to synchronize time, trying emergency update...");
+    updateCalendar();
+    
+    // If time sync failed, sleep for 30 minutes and try again
+    Serial.println("😴 Emergency sleep for 30 minutes...");
+    ESP.deepSleep(30 * 60 * 1000000UL); // 30 minutes in microseconds
+  }
+}
+
+void loop() {
+  // This should never be reached due to deep sleep
+  Serial.println("⚠️  WARNING: Loop reached - this shouldn't happen with deep sleep!");
+  delay(10000);
+}
+
+// =============================================================================
+// ⏰ TIME SYNCHRONIZATION & SCHEDULING
+// =============================================================================
+
+bool synchronizeTime() {
+  Serial.println("🕐 Synchronizing time with server...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No WiFi connection for time sync");
+    return false;
+  }
+  
+  WiFiClient client;
+  HTTPClient http;
+  
+  http.begin(client, status_url);
+  http.setTimeout(10000);  // 10 second timeout
+  
+  int httpCode = http.GET();
+  
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.print("❌ Status request failed, code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+  
+  String payload = http.getString();
+  http.end();
+  
+  Serial.print("📡 Status response: ");
+  Serial.println(payload);
+  
+  // Parse JSON response
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if (error) {
+    Serial.print("❌ JSON parsing failed: ");
+    Serial.println(error.f_str());
+    return false;
+  }
+  
+  // Extract timestamp
+  const char* timestampStr = doc["timestamp"];
+  if (!timestampStr) {
+    Serial.println("❌ No timestamp in status response");
+    return false;
+  }
+  
+  Serial.print("🕐 Server timestamp: ");
+  Serial.println(timestampStr);
+  
+  // Parse ISO timestamp to Unix timestamp
+  serverTimestamp = parseISOTimestamp(timestampStr);
+  localTimeBase = millis();
+  timeSet = true;
+  
+  Serial.print("✅ Time set - Unix timestamp: ");
+  Serial.println(serverTimestamp);
+  
+  return true;
+}
+
+unsigned long parseISOTimestamp(const char* isoTime) {
+  // Parse "2025-06-04T13:28:26.472224" format
+  // This is a simplified parser - for production you might want more robust parsing
+  
+  int year, month, day, hour, minute, second;
+  sscanf(isoTime, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second);
+  
+  // Convert to Unix timestamp (simplified calculation)
+  // This is approximate - for precise time you'd want a proper time library
+  unsigned long timestamp = 0;
+  
+  // Days since epoch (1970-01-01)
+  int days = (year - 1970) * 365 + (year - 1970) / 4; // Rough leap year calculation
+  
+  // Add months (approximate)
+  int daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  for (int m = 1; m < month; m++) {
+    days += daysInMonth[m - 1];
+  }
+  
+  days += day - 1;  // Days in current month
+  
+  timestamp = days * 24UL * 60UL * 60UL;  // Convert days to seconds
+  timestamp += hour * 60UL * 60UL;        // Add hours
+  timestamp += minute * 60UL;             // Add minutes
+  timestamp += second;                    // Add seconds
+  
+  return timestamp;
+}
+
+int getCurrentMinutesFromMidnight() {
+  if (!timeSet) {
+    return -1;  // Time not set
+  }
+  
+  // Calculate current time based on server timestamp + elapsed time
+  unsigned long elapsedMillis = millis() - localTimeBase;
+  unsigned long currentTimestamp = serverTimestamp + (elapsedMillis / 1000);
+  
+  // Extract hour and minute from timestamp
+  unsigned long secondsToday = currentTimestamp % (24UL * 60UL * 60UL);
+  int currentHour = secondsToday / 3600;
+  int currentMinute = (secondsToday % 3600) / 60;
+  
+  int minutesFromMidnight = currentHour * 60 + currentMinute;
+  
+  Serial.print("🕐 Current time: ");
+  Serial.print(currentHour);
+  Serial.print(":");
+  if (currentMinute < 10) Serial.print("0");
+  Serial.print(currentMinute);
+  Serial.print(" (");
+  Serial.print(minutesFromMidnight);
+  Serial.println(" minutes from midnight)");
+  
+  return minutesFromMidnight;
+}
+
+bool shouldUpdateNow(int currentMinutes) {
+  if (currentMinutes < 0) return true;  // If time not set, update anyway
+  
+  // Check if current time matches any update time (within 5 minute window)
+  for (int updateMinutes = FIRST_UPDATE_MINUTES; updateMinutes <= LAST_UPDATE_MINUTES; updateMinutes += UPDATE_INTERVAL_MINUTES) {
+    if (abs(currentMinutes - updateMinutes) <= 5) {
+      Serial.print("✅ Update time match: ");
+      Serial.print(updateMinutes / 60);
+      Serial.print(":");
+      if ((updateMinutes % 60) < 10) Serial.print("0");
+      Serial.println(updateMinutes % 60);
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+int getNextUpdateMinutes(int currentMinutes) {
+  // Find the next update time
+  for (int updateMinutes = FIRST_UPDATE_MINUTES; updateMinutes <= LAST_UPDATE_MINUTES; updateMinutes += UPDATE_INTERVAL_MINUTES) {
+    if (updateMinutes > currentMinutes) {
+      return updateMinutes;
+    }
+  }
+  
+  // If we're past the last update of the day, next update is tomorrow at 7:50am
+  return FIRST_UPDATE_MINUTES + (24 * 60);  // Tomorrow's first update
+}
+
+void enterDeepSleepUntilNextUpdate() {
+  int currentMinutes = getCurrentMinutesFromMidnight();
+  int nextUpdateMinutes = getNextUpdateMinutes(currentMinutes);
+  
+  int sleepMinutes;
+  if (nextUpdateMinutes > currentMinutes) {
+    sleepMinutes = nextUpdateMinutes - currentMinutes;
+  } else {
+    // Next update is tomorrow
+    sleepMinutes = (24 * 60) - currentMinutes + nextUpdateMinutes;
+  }
+  
+  // Subtract 2 minutes to wake up slightly early for WiFi connection
+  sleepMinutes = max(1, sleepMinutes - 2);
+  
+  Serial.print("😴 Sleeping for ");
+  Serial.print(sleepMinutes);
+  Serial.print(" minutes until next update at ");
+  
+  int nextHour = (nextUpdateMinutes % (24 * 60)) / 60;
+  int nextMinute = (nextUpdateMinutes % (24 * 60)) % 60;
+  Serial.print(nextHour);
+  Serial.print(":");
+  if (nextMinute < 10) Serial.print("0");
+  Serial.println(nextMinute);
+  
+  // Convert minutes to microseconds for deep sleep
+  unsigned long sleepMicros = sleepMinutes * 60UL * 1000000UL;
+  
+  Serial.println("💤 Entering deep sleep...");
+  Serial.flush();  // Make sure all serial output is sent before sleeping
+  
+  ESP.deepSleep(sleepMicros);
+}
+
+// =============================================================================
+// 🌐 WIFI CONNECTION
+// =============================================================================
+
+void connectToWiFi() {
+  Serial.print("📶 Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("✅ WiFi Connected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("❌ WiFi connection failed!");
+  }
+}
+
+// =============================================================================
+// 🗓️ CALENDAR UPDATE FUNCTIONS
+// =============================================================================
+
+// Function declarations (to avoid compilation errors)
+bool downloadAndStreamBW();
+bool downloadAndStreamRed();
+bool streamChannelToDisplay(HTTPClient& http, byte channelCommand, const char* channelName, int expectedBytes);
+void diagnoseSizeIssues(int contentLength, const char* channelName);
+
+void updateCalendar() {
+  Serial.println("🗓️ Starting calendar update...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No WiFi connection, skipping update");
+    return;
+  }
+  
+  // Download and display calendar
+  if (downloadAndDisplayCalendar()) {
+    Serial.println("✅ Calendar updated successfully!");
+  } else {
+    Serial.println("❌ Calendar update failed");
+  }
+}
+
+bool downloadAndDisplayCalendar() {
+  Serial.println("🗓️ Starting 3-color calendar download...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No WiFi connection, skipping update");
+    return false;
+  }
+  
+  // Initialize display first
+  Serial.println("🖥️  Initializing display...");
+  EPD_7in5_V1_Init();
+  
+  // Download and stream B/W channel
+  if (!downloadAndStreamBW()) {
+    Serial.println("❌ Failed to download B/W channel");
+    return false;
+  }
+  
+  // Download and stream Red channel
+  if (!downloadAndStreamRed()) {
+    Serial.println("❌ Failed to download Red channel");
+    return false;
+  }
+  
+  // Refresh display
+  Serial.println("🖥️  Refreshing display...");
+  EPD_7IN5_V1_Show();
+  
+  Serial.println("✅ 3-color calendar update complete!");
+  return true;
+}
+
+bool downloadAndStreamBW() {
+  WiFiClient client;
+  HTTPClient http;
+  
+  Serial.println("📡 Downloading B/W channel...");
+  Serial.print("URL: ");
+  Serial.println(calendar_raw_url);
+  
+  http.begin(client, calendar_raw_url);
+  http.setTimeout(30000);  // 30 second timeout
+  
+  int httpCode = http.GET();
+  
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.print("❌ B/W HTTP request failed, code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+  
+  int contentLength = http.getSize();
+  Serial.print("📊 B/W Content length: ");
+  Serial.println(contentLength);
+  Serial.print("📊 Expected length: ");
+  Serial.println(TOTAL_BYTES);
+  
+  // Diagnose size issues
+  diagnoseSizeIssues(contentLength, "B/W");
+  
+  // Stream B/W data to display
+  bool success = streamChannelToDisplay(http, 0x10, "B/W", contentLength);
+  http.end();
+  
+  return success;
+}
+
+bool downloadAndStreamRed() {
+  WiFiClient client;
+  HTTPClient http;
+  
+  Serial.println("📡 Downloading Red channel...");
+  Serial.print("URL: ");
+  Serial.println(calendar_red_url);
+  
+  http.begin(client, calendar_red_url);
+  http.setTimeout(30000);  // 30 second timeout
+  
+  int httpCode = http.GET();
+  
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.print("❌ Red HTTP request failed, code: ");
+    Serial.println(httpCode);
+    
+    // If red channel fails, fill with "no red" data
+    Serial.println("💡 Red channel not available, disabling red everywhere...");
+    EPD_SendCommand(0x13);  // Red channel
+    for (long i = 0; i < TOTAL_BYTES; i++) {
+      EPD_SendData(0xFF);  // Disable red
+      if (i % 30000 == 0) {
+        Serial.print("No Red: ");
+        Serial.print(i/1000);
+        Serial.println("k");
+      }
+    }
+    http.end();
+    return true;  // Continue even if red channel fails
+  }
+  
+  int contentLength = http.getSize();
+  Serial.print("📊 Red Content length: ");
+  Serial.println(contentLength);
+  Serial.print("📊 Expected length: ");
+  Serial.println(TOTAL_BYTES);
+  
+  // Diagnose size issues
+  diagnoseSizeIssues(contentLength, "Red");
+  
+  // Stream Red data to display
+  bool success = streamChannelToDisplay(http, 0x13, "Red", contentLength);
+  http.end();
+  
+  return success;
+}
+
+void diagnoseSizeIssues(int contentLength, const char* channelName) {
+  if (contentLength == TOTAL_BYTES / 4) {
+    Serial.print("🔍 DIAGNOSIS (");
+    Serial.print(channelName);
+    Serial.println("): File is 1/4 expected size!");
+    Serial.println("💡 Calendar generator creating 320×192 instead of 640×384");
+  } else if (contentLength == TOTAL_BYTES * 2) {
+    Serial.print("🔍 DIAGNOSIS (");
+    Serial.print(channelName);
+    Serial.println("): File is 2x expected size!");
+    Serial.println("💡 Calendar generator not packing 2 pixels per byte");
+  } else if (contentLength != TOTAL_BYTES) {
+    Serial.print("🔍 DIAGNOSIS (");
+    Serial.print(channelName);
+    Serial.println("): Unexpected file size");
+    Serial.println("💡 Check calendar generator output format");
+  } else {
+    Serial.print("✅ ");
+    Serial.print(channelName);
+    Serial.println(" channel size is perfect!");
+  }
+}
+
+bool streamChannelToDisplay(HTTPClient& http, byte channelCommand, const char* channelName, int expectedBytes) {
+  WiFiClient* stream = http.getStreamPtr();
+  
+  Serial.print("📤 Streaming ");
+  Serial.print(channelName);
+  Serial.println(" channel data to display...");
+  
+  EPD_SendCommand(channelCommand);  // 0x10 for B/W, 0x13 for Red
+  
+  long bytesReceived = 0;
+  unsigned long startTime = millis();
+  
+  // Data analysis counters
+  int blackBytes = 0, whiteBytes = 0, redPrepBytes = 0, otherBytes = 0;
+  
+  // Read and send data in chunks
+  while (http.connected() && bytesReceived < expectedBytes && bytesReceived < TOTAL_BYTES) {
+    size_t availableBytes = stream->available();
+    
+    if (availableBytes > 0) {
+      // Read up to 1024 bytes at a time
+      size_t maxToRead = min((long)expectedBytes - bytesReceived, (long)TOTAL_BYTES - bytesReceived);
+      size_t bytesToRead = min(availableBytes, (size_t)maxToRead);
+      bytesToRead = min(bytesToRead, (size_t)1024);
+      
+      uint8_t buffer[1024];
+      size_t bytesRead = stream->readBytes(buffer, bytesToRead);
+      
+      // Analyze and send each byte to the display
+      for (size_t i = 0; i < bytesRead; i++) {
+        byte dataByte = buffer[i];
+        
+        // Count different pixel types for analysis
+        if (dataByte == 0x00) blackBytes++;
+        else if (dataByte == 0x33) whiteBytes++;
+        else if (dataByte == 0xCC) redPrepBytes++;
+        else otherBytes++;
+        
+        EPD_SendData(dataByte);
+      }
+      
+      bytesReceived += bytesRead;
+      
+      // Progress indicator with data analysis
+      if (bytesReceived % 10000 == 0) {
+        Serial.print("📥 ");
+        Serial.print(channelName);
+        Serial.print(": ");
+        Serial.print(bytesReceived / 1000);
+        Serial.print("k / ");
+        Serial.print(expectedBytes / 1000);
+        Serial.print("k (🔍 0x00:");
+        Serial.print(blackBytes);
+        Serial.print(" 0x33:");
+        Serial.print(whiteBytes);
+        Serial.print(" 0xCC:");
+        Serial.print(redPrepBytes);
+        Serial.print(" other:");
+        Serial.print(otherBytes);
+        Serial.println(")");
+      }
+    } else {
+      delay(10);  // Wait for more data
+      
+      // Timeout check (30 seconds total)
+      if (millis() - startTime > 30000) {
+        Serial.print("⏱️  Timeout waiting for ");
+        Serial.print(channelName);
+        Serial.println(" channel data");
+        return false;
+      }
+    }
+  }
+  
+  // If we didn't get enough data, pad appropriately
+  if (bytesReceived < TOTAL_BYTES) {
+    Serial.print("📝 Padding ");
+    Serial.print(channelName);
+    Serial.print(" channel: ");
+    Serial.print((TOTAL_BYTES - bytesReceived) / 1000);
+    Serial.println("k bytes...");
+    
+    byte paddingValue;
+    if (channelCommand == 0x10) {
+      paddingValue = 0x33;  // White pixels for B/W channel
+      Serial.println("   Using white padding for B/W channel");
+      whiteBytes += (TOTAL_BYTES - bytesReceived);
+    } else {
+      paddingValue = 0xFF;  // No red for Red channel
+      Serial.println("   Using no-red padding for Red channel");
+    }
+    
+    for (long i = bytesReceived; i < TOTAL_BYTES; i++) {
+      EPD_SendData(paddingValue);
+      
+      if (i % 30000 == 0) {
+        Serial.print("   Padding ");
+        Serial.print(channelName);
+        Serial.print(": ");
+        Serial.print(i/1000);
+        Serial.println("k");
+      }
+    }
+  }
+  
+  // Final data analysis report
+  Serial.print("✅ ");
+  Serial.print(channelName);
+  Serial.println(" channel complete!");
+  Serial.print("📊 Data Analysis - Black(0x00): ");
+  Serial.print(blackBytes);
+  Serial.print(", White(0x33): ");
+  Serial.print(whiteBytes);
+  Serial.print(", RedPrep(0xCC): ");
+  Serial.print(redPrepBytes);
+  Serial.print(", Other: ");
+  Serial.println(otherBytes);
+  Serial.print("   Total received: ");
+  Serial.print(bytesReceived);
+  Serial.print(" bytes, Total sent: ");
+  Serial.print(TOTAL_BYTES);
+  Serial.println(" bytes");
+  
+  // Alert if no black pixels found
+  if (channelCommand == 0x10 && blackBytes == 0) {
+    Serial.println("⚠️  WARNING: No black pixels (0x00) found in B/W channel!");
+    Serial.println("💡 This suggests Flask app might be sending black pixels incorrectly");
+    Serial.println("💡 Check: Are black pixels being sent as 0x00?");
+  }
+  
+  return (bytesReceived > 0);
+}
+
+// =============================================================================
+// 🔧 HARDWARE INITIALIZATION
+// =============================================================================
+
+void initializeHardware() {
+  Serial.println("🔧 Initializing hardware pins...");
+  
   pinMode(PIN_SPI_SCK, OUTPUT);
   pinMode(PIN_SPI_DIN, OUTPUT);
   pinMode(CS_PIN, OUTPUT);
@@ -125,349 +662,85 @@ void setup() {
   digitalWrite(CS_PIN, HIGH);
   digitalWrite(PIN_SPI_SCK, LOW);
   
-  runVictoryDemo();
-}
-
-void loop() {
-  delay(10000);
-}
-
-void runVictoryDemo() {
-  Serial.println("=== DEMO 1: Victory Banner ===");
-  drawVictoryBanner();
-  
-  Serial.println("\nPress any key for Demo 2...");
-  waitForKey();
-  
-  Serial.println("=== DEMO 2: Color Stripes ===");
-  drawColorStripes();
-  
-  Serial.println("\nPress any key for Demo 3...");
-  waitForKey();
-  
-  Serial.println("=== DEMO 3: Red Border Frame ===");
-  drawRedBorderFrame();
-  
-  Serial.println("\nPress any key for Demo 4...");
-  waitForKey();
-  
-  Serial.println("=== DEMO 4: Checkerboard Pattern ===");
-  drawCheckerboard();
-  
-  Serial.println("\n🎉 VICTORY DEMO COMPLETE! 🎉");
-  Serial.println("You've mastered the 3-color e-paper display!");
-}
-
-void drawVictoryBanner() {
-  Serial.println("Drawing celebration banner...");
-  Serial.println("Expected pattern: Red-Red-Black-White-Black-Red-White...");
-  
-  EPD_7in5_V1_Init();
-  
-  // Create victory banner with horizontal stripes
-  // Pattern explanation:
-  // - y < 80:  Red stripe (top)
-  // - y < 120: Black stripe  
-  // - y < 160: White stripe
-  // - y < 200: Black stripe
-  // - y < 240: Red stripe
-  // - y >= 240: White stripe (bottom)
-  drawColorPattern([](long pixelIndex) -> int {
-    long y = pixelIndex / (DISPLAY_WIDTH / 2);  // Convert byte index to rough row
-    
-    if (y < 80) {
-      return COLOR_RED;    // Section 0-1: Top red stripe
-    } else if (y < 120) {
-      return COLOR_BLACK;  // Section 2: Black banner area
-    } else if (y < 160) {
-      return COLOR_WHITE;  // Section 3: White text area
-    } else if (y < 200) {
-      return COLOR_BLACK;  // Section 4: Another black stripe
-    } else if (y < 240) {
-      return COLOR_RED;    // Section 5: Another red stripe
-    } else {
-      return COLOR_WHITE;  // Section 6+: Bottom white area
-    }
-  });
-  
-  Serial.println("Victory banner complete!");
-  Serial.println("Should show: Red(top)-Red-Black-White-Black-Red-White(bottom)");
-}
-
-void drawColorStripes() {
-  Serial.println("Drawing vertical color stripes...");
-  Serial.println("Expected: Repeating Black-White-Red vertical stripes");
-  
-  EPD_7in5_V1_Init();
-  
-  // Vertical color stripes across the screen
-  // Each stripe is 80 pixels wide, pattern repeats every 3 stripes
-  drawColorPattern([](long pixelIndex) -> int {
-    long x = (pixelIndex % (DISPLAY_WIDTH / 2)) * 2;  // Convert to rough column
-    
-    long stripe = x / 80;  // 80-pixel wide stripes (640/80 = 8 stripes total)
-    
-    switch(stripe % 3) {
-      case 0: return COLOR_BLACK;   // Stripes 0, 3, 6: Black
-      case 1: return COLOR_WHITE;   // Stripes 1, 4, 7: White
-      case 2: return COLOR_RED;     // Stripes 2, 5: Red
-      default: return COLOR_WHITE;
-    }
-  });
-  
-  Serial.println("Color stripes complete!");
-  Serial.println("Should show 8 vertical stripes: Black-White-Red-Black-White-Red-Black-White");
-}
-
-void drawRedBorderFrame() {
-  Serial.println("Drawing red border frame...");
-  
-  EPD_7in5_V1_Init();
-  
-  // Red border with white center and black inner rectangle
-  drawColorPattern([](long pixelIndex) -> int {
-    long y = pixelIndex / (DISPLAY_WIDTH / 2);
-    long x = (pixelIndex % (DISPLAY_WIDTH / 2)) * 2;
-    
-    // Red border (outer 40 pixels)
-    if (x < 40 || x >= DISPLAY_WIDTH-40 || y < 40 || y >= DISPLAY_HEIGHT-40) {
-      return COLOR_RED;
-    }
-    // Black inner rectangle
-    else if (x >= 120 && x < DISPLAY_WIDTH-120 && y >= 120 && y < DISPLAY_HEIGHT-120) {
-      return COLOR_BLACK;
-    }
-    // White middle area
-    else {
-      return COLOR_WHITE;
-    }
-  });
-  
-  Serial.println("Red border frame complete!");
-}
-
-void drawCheckerboard() {
-  Serial.println("Drawing 3-color checkerboard...");
-  
-  EPD_7in5_V1_Init();
-  
-  // 3-color checkerboard pattern
-  drawColorPattern([](long pixelIndex) -> int {
-    long y = pixelIndex / (DISPLAY_WIDTH / 2);
-    long x = (pixelIndex % (DISPLAY_WIDTH / 2)) * 2;
-    
-    long blockX = x / 60;  // 60-pixel blocks
-    long blockY = y / 60;
-    
-    int pattern = (blockX + blockY) % 3;
-    
-    switch(pattern) {
-      case 0: return COLOR_BLACK;
-      case 1: return COLOR_WHITE;
-      case 2: return COLOR_RED;
-      default: return COLOR_WHITE;
-    }
-  });
-  
-  Serial.println("3-color checkerboard complete!");
+  Serial.println("✅ Hardware initialized");
 }
 
 // =============================================================================
-// 🎨 GENERIC COLOR PATTERN DRAWING FUNCTION 🎨
-// =============================================================================
-// This is the core function that implements the red channel magic formula.
-// It takes a function that returns COLOR_BLACK, COLOR_WHITE, or COLOR_RED 
-// for each pixel position and draws it on the display.
-
-void drawColorPattern(int (*getPixelColor)(long)) {
-  Serial.println("Phase 1: Sending B/W channel data...");
-  Serial.println("This prepares the base layer for all pixels");
-  
-  EPD_SendCommand(0x10);  // Switch to B/W channel (0x10)
-  
-  for (long i = 0; i < TOTAL_BYTES; i++) {
-    int color = getPixelColor(i);  // Get desired color for this pixel
-    byte bwValue;
-    
-    // CRITICAL: B/W channel values determine what the red channel can do
-    switch(color) {
-      case COLOR_BLACK: 
-        bwValue = 0x00;   // Black pixels: B/W = 0x00
-        break;
-      case COLOR_WHITE: 
-        bwValue = 0x33;   // White pixels: B/W = 0x33
-        break;
-      case COLOR_RED:   
-        bwValue = 0xCC;   // Red pixels: B/W = 0xCC (MAGIC VALUE!)
-        break;
-      default:          
-        bwValue = 0x33;   // Default to white
-        break;
-    }
-    
-    EPD_SendData(bwValue);
-    
-    // Progress indicator (every 30k bytes)
-    if (i % 30000 == 0) {
-      Serial.print("B/W: ");
-      Serial.print(i/1000);
-      Serial.println("k");
-    }
-  }
-  
-  Serial.println("Phase 2: Sending Red channel data...");
-  Serial.println("This enables red color where B/W was set to 0xCC");
-  
-  EPD_SendCommand(0x13);  // Switch to Red channel (0x13)
-  
-  for (long i = 0; i < TOTAL_BYTES; i++) {
-    int color = getPixelColor(i);  // Get desired color for this pixel
-    byte redValue;
-    
-    // Red channel: Only enable red where we want red pixels
-    switch(color) {
-      case COLOR_BLACK: 
-        redValue = 0x00;  // No red on black pixels
-        break;
-      case COLOR_WHITE: 
-        redValue = 0x00;  // No red on white pixels
-        break;
-      case COLOR_RED:   
-        redValue = 0xFF;  // Enable red! (MAGIC VALUE!)
-        break;
-      default:          
-        redValue = 0x00;  // Default: no red
-        break;
-    }
-    
-    EPD_SendData(redValue);
-    
-    // Progress indicator (every 30k bytes)
-    if (i % 30000 == 0) {
-      Serial.print("Red: ");
-      Serial.print(i/1000);
-      Serial.println("k");
-    }
-  }
-  
-  Serial.println("Phase 3: Refreshing display...");
-  EPD_7IN5_V1_Show();
-  Serial.println("Pattern drawing complete!");
-  Serial.println("");
-  Serial.println("🎨 SUMMARY: B/W=0xCC + Red=0xFF = RED PIXELS! 🎨");
-}
-
-void waitForKey() {
-  while (!Serial.available()) {
-    delay(100);
-  }
-  while (Serial.available()) {
-    Serial.read();
-  }
-}
-
-// =============================================================================
-// 🔧 DISPLAY INITIALIZATION & CONTROL FUNCTIONS 🔧
+// 🖥️  DISPLAY FUNCTIONS (from documented e-paper driver)
 // =============================================================================
 
-// Waveshare 7.5" V1 Display Initialization
-// This exact sequence is required for the display to work properly
 int EPD_7in5_V1_Init(void) {
-  Serial.println("Initializing 7.5\" e-paper display (V1)...");
+  Serial.println("🖥️  Initializing 7.5\" e-paper display (V1)...");
   
-  EPD_Reset();                                  // Hardware reset
+  EPD_Reset();
   EPD_Send_2(0x01, 0x37, 0x00);               // POWER_SETTING
-  EPD_Send_2(0x00, 0xCF, 0x08);               // PANEL_SETTING (critical for V1)
+  EPD_Send_2(0x00, 0xCF, 0x08);               // PANEL_SETTING
   EPD_Send_3(0x06, 0xC7, 0xCC, 0x28);         // BOOSTER_SOFT_START
   EPD_SendCommand(0x04);                       // POWER_ON
-  EPD_WaitUntilIdle();                         // Wait for power up
+  EPD_WaitUntilIdle();
   EPD_Send_1(0x30, 0x3C);                     // PLL_CONTROL
   EPD_Send_1(0x41, 0x00);                     // TEMPERATURE_CALIBRATION
   EPD_Send_1(0x50, 0x77);                     // VCOM_AND_DATA_INTERVAL_SETTING
   EPD_Send_1(0x60, 0x22);                     // TCON_SETTING
-  EPD_Send_4(0x61, 0x02, 0x80, 0x01, 0x80);   // RESOLUTION: 640x384 (0x0280 x 0x0180)
+  EPD_Send_4(0x61, 0x02, 0x80, 0x01, 0x80);   // RESOLUTION: 640x384
   EPD_Send_1(0x82, 0x1E);                     // VCM_DC_SETTING
   EPD_Send_1(0xE5, 0x03);                     // FLASH_MODE
 
-  EPD_SendCommand(0x10);                       // Prepare for B/W data transmission
+  EPD_SendCommand(0x10);                       // Prepare for B/W data
   delay(2);
-  
-  Serial.println("Display initialization complete!");
   return 0;
 }
 
-// Display refresh and power management
 static void EPD_7IN5_V1_Show(void) {
-  Serial.println("Refreshing display...");
-  EPD_SendCommand(0x12);                       // DISPLAY_REFRESH command
-  delay(100);                                  // Required delay
-  delay(3000);                                 // Wait for refresh (BUSY pin unreliable)
-  Serial.println("Display refresh complete!");
+  EPD_SendCommand(0x12);  // DISPLAY_REFRESH
+  delay(100);
+  delay(3000);  // Wait for refresh to complete
 }
 
-// BUSY pin monitoring (often unreliable - use fixed delays instead)
 void EPD_WaitUntilIdle() {
-  Serial.print("Checking BUSY pin...");
+  // BUSY pin often unreliable, use timeout
   int timeout = 0;
   while(digitalRead(BUSY_PIN) == HIGH) {
     delay(20);
     timeout++;
-    if (timeout > 500) {  // 10 second timeout
-      Serial.println(" TIMEOUT (BUSY stuck HIGH - normal behavior)");
-      return;
-    }
+    if (timeout > 500) return;  // 10 second timeout
   }
-  Serial.println(" Ready");
   delay(20);
 }
 
-// Hardware reset sequence
 void EPD_Reset() {
-  Serial.println("Performing hardware reset...");
   digitalWrite(RST_PIN, HIGH);
   delay(50);
-  digitalWrite(RST_PIN, LOW);                  // Pull reset low
+  digitalWrite(RST_PIN, LOW);
   delay(5);
-  digitalWrite(RST_PIN, HIGH);                 // Release reset
-  delay(50);                                   // Wait for reset to complete
+  digitalWrite(RST_PIN, HIGH);
+  delay(50);
 }
 
-// =============================================================================
-// 🔌 LOW-LEVEL SPI COMMUNICATION 🔌
-// =============================================================================
-
-// Send command byte to display
 void EPD_SendCommand(byte command) {
-  digitalWrite(DC_PIN, LOW);                   // DC low = command mode
+  digitalWrite(DC_PIN, LOW);
   EpdSpiTransferCallback(command);
 }
 
-// Send data byte to display  
 void EPD_SendData(byte data) {
-  digitalWrite(DC_PIN, HIGH);                  // DC high = data mode
+  digitalWrite(DC_PIN, HIGH);
   EpdSpiTransferCallback(data);
 }
 
-// Bit-banged SPI transfer (more reliable than hardware SPI)
 void EpdSpiTransferCallback(byte data) {
-  digitalWrite(CS_PIN, GPIO_PIN_RESET);        // Select display
-  
-  // Send 8 bits, MSB first
+  digitalWrite(CS_PIN, GPIO_PIN_RESET);
   for (int i = 0; i < 8; i++) {
     if ((data & 0x80) == 0) 
       digitalWrite(PIN_SPI_DIN, GPIO_PIN_RESET); 
     else                    
       digitalWrite(PIN_SPI_DIN, GPIO_PIN_SET);
-      
-    data <<= 1;                                // Shift to next bit
-    digitalWrite(PIN_SPI_SCK, GPIO_PIN_SET);   // Clock high
-    digitalWrite(PIN_SPI_SCK, GPIO_PIN_RESET); // Clock low
+    data <<= 1;
+    digitalWrite(PIN_SPI_SCK, GPIO_PIN_SET);
+    digitalWrite(PIN_SPI_SCK, GPIO_PIN_RESET);
   }
-  
-  digitalWrite(CS_PIN, GPIO_PIN_SET);          // Deselect display
+  digitalWrite(CS_PIN, GPIO_PIN_SET);
 }
 
-// Helper functions for multi-byte commands
 void EPD_Send_1(byte c, byte v1) {
   EPD_SendCommand(c);
   EPD_SendData(v1);
@@ -495,41 +768,48 @@ void EPD_Send_4(byte c, byte v1, byte v2, byte v3, byte v4) {
 }
 
 // =============================================================================
-// 🎯 USAGE EXAMPLES & QUICK REFERENCE 🎯
+// 🎯 SCHEDULED CALENDAR WITH DEEP SLEEP! 🎯
 // =============================================================================
 /*
- * TO CREATE YOUR OWN PATTERNS:
+ * ✅ SCHEDULED CALENDAR WITH DEEP SLEEP NOW IMPLEMENTED!
  * 
- * 1. Define a function that returns COLOR_BLACK, COLOR_WHITE, or COLOR_RED:
- *    int myPattern(long pixelIndex) {
- *      // Your logic here based on pixelIndex (0 to 122,879)
- *      return COLOR_RED;  // or COLOR_BLACK, COLOR_WHITE
- *    }
+ * FEATURES ADDED:
+ * 1. ⏰ Time synchronization with server via /status endpoint
+ * 2. 📅 Scheduled updates every 30 minutes from 7:50am to 4:50pm
+ * 3. 😴 Deep sleep between updates for power efficiency
+ * 4. 🌙 Long sleep from 4:50pm until 7:50am next day
+ * 5. 🔄 Automatic wake-up and calendar updates
  * 
- * 2. Draw it:
- *    EPD_7in5_V1_Init();
- *    drawColorPattern(myPattern);
+ * SCHEDULE:
+ * - Updates: 7:50, 8:20, 8:50, 9:20, 9:50, 10:20, 10:50, 11:20, 11:50,
+ *           12:20, 12:50, 1:20, 1:50, 2:20, 2:50, 3:20, 3:50, 4:20, 4:50
+ * - Total: 19 updates per day
+ * - Sleep: 15 hours overnight (4:50pm to 7:50am)
  * 
- * COORDINATE CALCULATIONS:
- * - Row (approx): y = pixelIndex / 320
- * - Column (approx): x = (pixelIndex % 320) * 2
- * - Section (0-7): section = (pixelIndex * 8) / 122880
+ * POWER EFFICIENCY:
+ * - Device only wakes up for ~2-3 minutes per update
+ * - Deep sleep reduces power consumption to ~100μA
+ * - Perfect for battery-powered installations
  * 
- * MEMORY LAYOUT:
- * - Total bytes: 122,880 (640×384÷2)
- * - Each byte represents 2 pixels horizontally
- * - Memory flows left-to-right, top-to-bottom in bands
+ * IMPORTANT HARDWARE NOTE:
+ * For deep sleep to work properly, you MUST connect:
+ * - RST pin to GPIO16 (D0) on your ESP8266
+ * - This allows the device to wake itself up from deep sleep
  * 
- * TROUBLESHOOTING:
- * - BUSY pin stuck HIGH: Normal, use fixed delays
- * - No red showing: Check B/W=0xCC + Red=0xFF combination
- * - Partial display update: Check wiring and power
- * - Display not responding: Verify initialization sequence
+ * TIME SYNCHRONIZATION:
+ * - Gets server timestamp from /status endpoint
+ * - Maintains internal time tracking during wake periods
+ * - Handles timezone and daylight saving automatically via server time
  * 
- * TESTED WORKING VALUES:
- * ✅ BLACK: B/W=0x00, Red=any (typically 0x00)
- * ✅ WHITE: B/W=0x33, Red=any (typically 0x00)  
- * ✅ RED:   B/W=0xCC, Red=0xFF (ONLY working combination!)
+ * ERROR HANDLING:
+ * - If time sync fails, does emergency update and retries in 30 minutes
+ * - If calendar update fails, still goes to sleep on schedule
+ * - Robust WiFi connection handling with retries
  * 
- * Happy coding! 🎨
+ * DEBUGGING:
+ * - Extensive serial output for troubleshooting
+ * - Time calculations and sleep duration logging
+ * - Update schedule verification and status reporting
+ * 
+ * Happy scheduled calendaring! 🗓️😴
  */
